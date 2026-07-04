@@ -1,7 +1,7 @@
 """
 flywheel_energy.py — 飞轮储能系统模型
 E = ½Jω²  ·  SOC  ·  功率流  ·  损耗  ·  热模型
-泓慧能源 1.2MW/3kWh 飞轮UPS参考参数
+泓慧能源 500kW/3kWh 飞轮UPS — 30Cr42MoV钢转子, 8800rpm@33.9kg·m²
 """
 import math
 import numpy as np
@@ -13,28 +13,44 @@ from typing import Optional
 class FlywheelConfig:
     """飞轮参数 (泓慧 500kW/3kWh 单极感应子飞轮, P=6对极, 电励磁)
 
-    J = 2E/ω² = 2×10.8MJ/(209.4rad/s)² ≈ 492 kg·m²
+    转子: 30Cr42MoV 高强度合金钢, σ_y≈950MPa
+    几何: D=760mm(R=380mm), L=260mm, 轮毂+辐条结构
+    储能: 3kWh 可用 (8800→4400rpm)
+    J = 2×10.8MJ/(ω_max² - ω_min²) = 33.9 kg·m²
     """
-    J: float = 492.0           # 转动惯量 kg·m²
-    omega_max: float = 2000.0  # 最大转速 rpm
-    omega_min: float = 800.0   # 最小转速 rpm (放电截止, ~16% SOC)
-    omega_nom: float = 1800.0  # 额定转速 rpm
-    P_rated: float = 500e3     # 额定功率 W (500kW)
-    Vdc_nom: float = 750.0     # 直流母线标称电压 V (750VDC)
-    Vac_nom: float = 480.0     # 交流侧线电压 Vrms (480VAC)
-    Poles: int = 6             # 极对数 (6对极, 单极感应子)
+    # ── 物理规格 ──
+    J: float = 33.9            # 转动惯量 kg·m² (能量反推)
+    mass_rotor: float = 855.0  # 转子质量 kg (估算)
+    R_rotor: float = 0.380     # 转子外径 m (760mm)
+    L_rotor: float = 0.260     # 转子厚度 m (260mm)
+    material: str = "30Cr42MoV"
+    sigma_y: float = 950e6     # 芯部屈服强度 Pa
 
-    # ── 电励磁参数 (励磁从 DC 母线取电) ──
-    Rf: float = 75.0           # 励磁绕组电阻 Ω (750V/10A≈75Ω)
+    # ── 转速 ──
+    omega_max: float = 8800.0  # 工作最高转速 rpm
+    omega_min: float = 4400.0  # 工作最低转速 rpm (放电截止)
+    omega_nom: float = 8800.0  # 额定转速 rpm
+    omega_overspeed: float = 9900.0  # 超速保护转速 rpm (112.5%)
+
+    # ── 功率 ──
+    P_rated: float = 500e3     # 额定功率 W (500kW)
+    P_peak: float = 800e3      # 短时过载功率 W (800kW)
+
+    # ── 电气接口 ──
+    Vdc_nom: float = 750.0     # 直流母线标称电压 V
+    Vac_nom: float = 480.0     # 交流侧线电压 Vrms
+    Poles: int = 6             # 极对数 (单极感应子, 12极定子/6齿转子)
+
+    # ── 电励磁参数 ──
+    Rf: float = 75.0           # 励磁绕组电阻 Ω
     If_nom: float = 10.0       # 额定励磁电流 A
     Lf: float = 5.0            # 励磁绕组电感 H
-    # 励磁产生的等效磁链: ψf = Lf·If_nom ≈ 5×10 = 50 Wb (需除以极对数归一化)
-    # 实际 d 轴磁链 ψd ≈ Lmd·If / P ≈ 0.1×10/6 ≈ 0.167 Wb
+    # 励磁功率 P_exc = If²·Rf = 7.5kW (DC 母线取电, 恒定开销)
 
-    # 损耗系数
-    k_windage: float = 0.001   # 风阻系数 Nm·(s/rad)² (T_loss = k_windage·ω²)
-    k_bearing: float = 0.5     # 轴承摩擦系数 Nm
-    P_fixed: float = 50.0      # 固定损耗 W (控制电源/真空泵)
+    # ── 损耗系数 (⚠️ 需台架数据标定) ──
+    k_windage: float = 0.0     # 风阻系数 (真空腔, 近似为零)
+    k_bearing: float = 0.5     # 轴承摩擦系数 Nm (需标定)
+    P_fixed: float = 200.0     # 固定损耗 W (控制电源/真空泵/传感器)
     R_thermal: float = 0.5     # 热阻 °C/W
     C_thermal: float = 5000.0  # 热容 J/°C
     T_ambient: float = 25.0    # 环境温度 °C
@@ -43,6 +59,10 @@ class FlywheelConfig:
     @property
     def omega_max_rad(self) -> float:
         return self.omega_max * 2 * math.pi / 60
+
+    @property
+    def omega_overspeed_rad(self) -> float:
+        return self.omega_overspeed * 2 * math.pi / 60
 
     @property
     def omega_min_rad(self) -> float:
@@ -54,7 +74,7 @@ class FlywheelConfig:
 
     @property
     def E_max_joules(self) -> float:
-        """最大储能 [J]"""
+        """最大储能 [J] — 工作最高转速, 不包含超速余量"""
         return 0.5 * self.J * self.omega_max_rad ** 2
 
 
@@ -109,14 +129,16 @@ class FlywheelEnergyStorage:
 
         # 2. 充放电限幅 (带 Vdc 降额: Vdc<80%时功率降至50%)
         vdc_factor = 1.0 if Vdc > 0.8 * cfg.Vdc_nom else max(0.3, Vdc / (0.8 * cfg.Vdc_nom) * 0.5)
-        P_max_charge = cfg.P_rated * vdc_factor
-        P_max_discharge = cfg.P_rated * vdc_factor
+        P_max_charge = cfg.P_peak * vdc_factor   # 峰值功率用于瞬时限幅
+        P_max_discharge = cfg.P_peak * vdc_factor
 
         # 转速边界保护: 超速只能放电, 欠速只能充电
-        if s.omega >= cfg.omega_max_rad:
-            P_grid = min(P_grid, 0)
+        if s.omega >= cfg.omega_overspeed_rad:
+            P_grid = min(P_grid, 0)  # 超速: 强制放电
+        elif s.omega >= cfg.omega_max_rad:
+            P_grid = min(P_grid, 0)  # 达到工作上限: 禁止充电
         elif s.omega <= cfg.omega_min_rad:
-            P_grid = max(P_grid, 0)
+            P_grid = max(P_grid, 0)  # 欠速: 强制充电
 
         P_grid = max(-P_max_discharge, min(P_max_charge, P_grid))
         # P_grid: 正值=从电网取电(充电), P_motor = P_grid - P_losses
@@ -159,7 +181,7 @@ class FlywheelEnergyStorage:
         s.temp += dT * Ts
 
         # 7. 模式判定 (不覆盖转速保护状态)
-        if s.omega >= cfg.omega_max_rad or s.omega <= cfg.omega_min_rad:
+        if s.omega >= cfg.omega_overspeed_rad or s.omega <= cfg.omega_min_rad:
             pass  # 保持边界状态, 不覆盖
         elif abs(P_motor) < 100:
             s.mode = "idle"
