@@ -29,6 +29,10 @@ from s4_scenarios import (
     build_all_scenarios, ScenarioID,
 )
 from s4_ai_controller import S4AIController, AIStrategy, GridSnapshot, AIControlAction
+from s4_metrics import (
+    HardConstraints, ParetoAnalyzer, RobustnessScorer, StrategyResult,
+    RobustnessStats, DecisionTable, build_decision_table,
+)
 
 
 # ═══════════════════════════════════════════
@@ -483,7 +487,55 @@ class S4ExperimentRunner:
         for i, (name, sc_list) in enumerate(ranked):
             avg = sum(sc_list) / len(sc_list)
             medal = ['🥇', '🥈', '🥉', '  '][min(i, 3)]
-            print(f"  {medal} {name:20s}  平均={avg:5.1f}  (min={min(sc_list):.0f}, max={max(sc_list):.0f})")
+            print(f"  {medal} {name:20s}  平均={avg:5.1f}  "
+                  f"(min={min(sc_list):.0f}, max={max(sc_list):.0f})")
+
+        # ── v2.0: 硬约束检查 ──
+        print(f"\n{'='*80}")
+        print(f"  硬约束检查 (IEC 62040 / GB/T)")
+        print(f"{'─'*80}")
+        any_failed = False
+        for sc_name, sc_results in all_results.items():
+            sc = next((s for s in scenarios if s.name == sc_name), None)
+            sid = sc.scenario_id if sc else None
+            for r in sc_results:
+                v = HardConstraints.check(r.metrics, sid)
+                if v.failed:
+                    any_failed = True
+                    print(f"  ❌ {r.strategy_name:20s} @ {sc_name}: {v.reason}")
+
+        if not any_failed:
+            print(f"  ✅ 所有策略在所有场景通过硬约束")
+
+        # ── v2.0: 帕累托前沿 (逐场景) ──
+        print(f"\n{'='*80}")
+        print(f"  帕累托前沿分析 (Vdc × 频率 × SOC)")
+        print(f"{'─'*80}")
+        for sc_name, sc_results in all_results.items():
+            sc = next((s for s in scenarios if s.name == sc_name), None)
+            sr_list = []
+            for r in sc_results:
+                dim_scores = ParetoAnalyzer.compute_dimension_scores(
+                    r.metrics, sc, 0.5
+                )
+                sr = StrategyResult(
+                    name=r.strategy_name,
+                    metrics=r.metrics,
+                    vdc_score=dim_scores["vdc"],
+                    freq_score=dim_scores["freq"],
+                    soc_score=dim_scores["soc"],
+                    eff_score=dim_scores["eff"],
+                    composite_score=r.metrics.composite_score,
+                )
+                sr_list.append(sr)
+
+            pareto = ParetoAnalyzer.analyze(sr_list, ["vdc", "freq", "soc"])
+            frontier_names = ", ".join(r.name for r in pareto.frontier)
+            dominated_names = ", ".join(r.name for r in pareto.dominated)
+            print(f"  [{sc_name}]")
+            print(f"    帕累托前沿: {frontier_names}")
+            if dominated_names:
+                print(f"    被支配:       {dominated_names}")
 
         return all_results
 
@@ -508,11 +560,40 @@ if __name__ == '__main__':
     parser.add_argument('--scenario', type=int, help='Run single scenario by ID (1-10)')
     parser.add_argument('--compare', action='store_true', help='Compare all strategies')
     parser.add_argument('--all', action='store_true', help='Run all scenarios with AI adaptive')
+    parser.add_argument('--robustness', type=int, metavar='N',
+                        help='Monte Carlo robustness: N runs with ±20%% parameter perturbation')
+    parser.add_argument('--strategy', type=str, default='adaptive',
+                        choices=['adaptive', 'predictive', 'rule', 'vdc', 'freq', 'vsg'],
+                        help='Strategy for single-scenario/robustness mode')
 
     args = parser.parse_args()
     runner = S4ExperimentRunner()
 
-    if args.compare:
+    if args.robustness:
+        # ── v2.0: 蒙特卡洛鲁棒性 ──
+        scenarios = build_all_scenarios()
+        sc = scenarios[0]  # default: 频率骤降
+        if args.scenario:
+            sc = next((s for s in scenarios if s.scenario_id.value == args.scenario), sc)
+
+        # 选择策略
+        strategy_map = {
+            'adaptive': ('AI 自适应', S4AIController(strategy=AIStrategy.ADAPTIVE)),
+            'predictive': ('AI 预测', S4AIController(strategy=AIStrategy.PREDICTIVE)),
+            'rule': ('AI 规则引擎', S4AIController(strategy=AIStrategy.RULE_BASED)),
+            'vdc': ('基线-固定VDC', BaselineFixedVDC()),
+            'freq': ('基线-固定调频', BaselineFixedFreq()),
+            'vsg': ('基线-固定VSG', BaselineFixedVSG()),
+        }
+        sname, ctrl = strategy_map[args.strategy]
+
+        stats = RobustnessScorer.monte_carlo(
+            runner, sc, ctrl, sname, n=args.robustness,
+            perturbation=0.20, verbose=True,
+        )
+        print(f"\n{vars(stats)}")
+
+    elif args.compare:
         runner.run_compare()
     elif args.scenario:
         scenarios = build_all_scenarios()
