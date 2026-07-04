@@ -175,6 +175,7 @@ class S4ExperimentRunner:
         freq_responded = False
         freq_response_time = 0
         total_loss = 0.0
+        max_df_observed = 0.0
 
         while step < total_steps:
             t = step * self.Ts
@@ -197,7 +198,7 @@ class S4ExperimentRunner:
                 Vdc=dc_bus.state.Vdc,
                 dVdc=dc_bus.state.Vdc - dc_bus.cfg.V_nom,
                 SOC=current_soc,
-                P_grid=0,
+                P_grid=inverter.state.P,
                 P_load=P_load_active,
                 f_pll=inverter.state.f_pll,
                 Vg_amplitude=inverter.state.Vg_amplitude,
@@ -207,19 +208,24 @@ class S4ExperimentRunner:
             if step % self.metrics_interval == 0:
                 action = controller.decide(snap)
 
-                # 逆变器始终 VDC_CONTROL (负责稳压)
-                # 编排器负责功率调度, DC_BUS/INERTIA 转换为 FREQ_REGULATION
-                actual_mode = action.mode
-                if actual_mode in (PowerMode.DC_BUS_CONTROL, PowerMode.INERTIA_SUPPORT):
-                    actual_mode = PowerMode.FREQ_REGULATION
-                orchestrator.mode = actual_mode
+                # 逆变器始终 VDC_CONTROL (负责电网侧整流稳压)
+                # 编排器忠实执行 AI/基线选择的模式 — 不再把 DC_BUS_CONTROL /
+                # INERTIA_SUPPORT 强行改写为 FREQ_REGULATION。
+                # [FIX-2026-07 迭代1] 旧版此处的别名重写会让所有依赖飞轮
+                # 直流母线支撑(dc_ctrl)的策略静默退化为纯调频策略。
+                orchestrator.mode = action.mode
 
-                # 应用决策参数
+                # 应用决策参数 (按实际执行的模式下发, 而非改写后的模式)
                 if action.mode == PowerMode.FREQ_REGULATION:
                     orchestrator.freq_reg.droop = action.droop
                     orchestrator.freq_reg.deadband = action.deadband
                 elif action.mode == PowerMode.VSG:
                     orchestrator.vsg.droop_p = action.droop
+                elif action.mode == PowerMode.DC_BUS_CONTROL:
+                    orchestrator.dc_ctrl.mode = action.dc_mode
+                elif action.mode == PowerMode.INERTIA_SUPPORT:
+                    orchestrator.freq_reg.droop = action.droop
+                    orchestrator.dc_ctrl.mode = action.dc_mode
 
                 decisions.append({
                     't': t, 'mode': action.mode.name, 'P_ref': action.P_ref,
@@ -266,6 +272,7 @@ class S4ExperimentRunner:
                 soc_min = min(soc_min, current_soc)
                 soc_max = max(soc_max, current_soc)
                 total_loss += flywheel.state.P_loss * self.Ts * self.metrics_interval
+                max_df_observed = max(max_df_observed, abs(grid.state.f - 50.0))
 
                 # 频率响应时间检测
                 if not freq_responded and abs(grid.state.f - 50.0) > 0.1:
@@ -300,7 +307,7 @@ class S4ExperimentRunner:
         )
 
         # ── 综合评分 ──
-        metrics.composite_score = self._compute_composite_score(metrics, scenario)
+        metrics.composite_score = self._compute_composite_score(metrics, scenario, max_df_observed)
 
         return ExperimentResult(
             scenario=scenario,
@@ -355,17 +362,40 @@ class S4ExperimentRunner:
 
         return P_load
 
-    def _compute_composite_score(self, m: ExperimentMetrics, s: ScenarioConfig) -> float:
-        """加权综合评分 (0-100, 越高越好)"""
+    def _compute_composite_score(self, m: ExperimentMetrics, s: ScenarioConfig,
+                                  max_df_observed: float = 0.0) -> float:
+        """加权综合评分 (0-100, 越高越好)
+
+        [FIX-2026-07 迭代2] 原评分公式对响应时间线性扣分且 200ms 归零,
+        而系统的决策周期(5ms采样)+ 飞轮惯量爬升 + droop 一次调频的物理响应
+        时间通常在 0.5~1s 量级, 属于正常, 不应被评为 0 分。
+        与此同时, 原公式对"从未响应"给出中性 50 分默认值, 造成一个从不
+        参与调频支撑的策略反而比慢速但真实响应的策略得分更高的悖论
+        (例如: 完全不理会频率骤降的固定VDC策略 58.1分 > 705ms内完成
+        droop响应的固定调频策略 24.5分)。这会在实际验收测试中把
+        "不作为"误判为优等策略, 是评估方法学上的重大缺陷。
+
+        新公式:
+          1. 用指数衰减代替线性衰减, 时间常数 τ=600ms, 更符合飞轮+droop
+             的真实响应特性 (100ms→~85分, 500ms→~43分, 1s→~19分)
+          2. 区分"场景本身无需响应"(max_df_observed 很小) 与
+             "场景确有事件但策略未响应"两种情况: 后者按事件严重程度扣分,
+             不再给中性分, 避免不作为策略被高估
+        """
 
         # Vdc 评分: 偏差越小越好
         vdc_score = max(0, 100 - m.vdc_max_dev * 2) if m.vdc_max_dev > 0 else 100
 
-        # 频率响应: 响应越快越好
+        # 频率响应: 指数衰减模型, 响应越快分越高; 真实无响应且确有事件则按事件严重度扣分
+        FREQ_EVENT_THRESHOLD = 0.06  # Hz, 低于此视为噪声/无实质事件
         if m.freq_response_t > 0:
-            freq_score = max(0, 100 - m.freq_response_t * 0.5)  # 200ms→0
+            freq_score = 100 * math.exp(-m.freq_response_t / 600.0)  # τ=600ms
+        elif max_df_observed < FREQ_EVENT_THRESHOLD:
+            freq_score = 100  # 场景本身没有明显频率事件, 不响应是正确的
         else:
-            freq_score = 50  # 未响应 = 中等
+            # 确有事件但从未响应 → 按超出阈值的严重程度扣分, 而非给中性分
+            severity = max_df_observed - FREQ_EVENT_THRESHOLD
+            freq_score = max(0, 35 - severity * 300)
 
         # SOC: 不越限满分
         soc_score = max(0, 100 - m.soc_violations * 20)
