@@ -1,24 +1,12 @@
 """
-inverter_topology.py — 多电平逆变器拓扑模块
+inverter_topology.py — 3种逆变器拓扑: 两电平VSI / 三电平NPC / 三电平T-type。统一接口: modulate(Vα,Vβ,Vdc)。
 
-支持:
-  - 两电平 VSI (2L-VSI): 8 个开关状态, 6 个有效矢量 + 2 个零矢量
-  - 三电平 NPC (3L-NPC): 27 个开关状态, 19 个独立矢量
-  - 三电平 T-type (3L-TNPC): 同 NPC, 用有源箝位
+子系统: 物理模型
+依赖: 无
+手册对应章节: ARCHITECTURE.md §1.1
 
-架构:
-  TopologyBase (ABC)
-    ├── TwoLevelVSI
-    ├── ThreeLevelNPC
-    └── ThreeLevelTNPC
-
-每个拓扑暴露:
-  - all_vectors(): 所有开关状态+对应的 αβ 电压矢量
-  - modulate(Vα, Vβ, Vdc): 给定参考电压 → 输出开关状态 + 占空比
-  - gate_signals(state): 开关状态 → 12/6 路门极信号
-  - dc_link_step(state, Ia, Ib, Ic, dt): 更新母线电容电压 (3L 的中点平衡)
+3种逆变器拓扑: 两电平VSI / 三电平NPC / 三电平T-type。统一接口: modulate(Vα,Vβ,Vdc)。
 """
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum

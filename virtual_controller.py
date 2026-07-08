@@ -1,8 +1,10 @@
 """
-virtual_controller.py — 虚拟控制器 (模拟 CODESYS 功能)
+virtual_controller.py — CODESYS 仿真替代: 六状态机 (待机/预充/就绪/辨识/运行/故障) + 电流环。
 
-状态机 + 电流环 PI + 速度环 P + SVPWM
-兼容所有电机类型 (MotorBase 子类)
+子系统: 控制层 (S3)
+依赖: motor_base.py, control_algorithms.py
+
+CODESYS 仿真替代: 六状态机 (待机/预充/就绪/辨识/运行/故障) + 电流环。
 """
 import numpy as np
 from enum import Enum
@@ -85,7 +87,8 @@ class VirtualController:
         elif self.state in (OpState.IDLE, OpState.READY, OpState.IDENTIFY):
             Vd_out, Vq_out = self.Vd_ref, self.Vq_ref
         elif self.state == OpState.PRECHARGE:
-            self._precharge_progress += self.ts / 0.003  # ~1 fragment cycle to 600V
+            # 真实预充 ~2s: 50μs/2s = 0.000025 per step → 40000步到满压
+            self._precharge_progress += self.ts / 2.0
             ms.Vdc = min(self.cfg.Vdc_nom, self._precharge_progress * self.cfg.Vdc_nom)
 
         # ── 电压限幅 ──

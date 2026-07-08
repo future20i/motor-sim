@@ -1,12 +1,19 @@
 """
-power_ops.py — 飞轮储能功率运行控制
-VSG · 一次调频 · 直流母线恒压 · 充放电管理 · 功率调度
+power_ops.py — 系统级功率调度编排器: VSG/一次调频/直流母线恒压/充放电管理。负责两套符号约定的转换。
+
+子系统: 控制层
+依赖: flywheel_energy.py, grid_sim.py, dc_bus.py, motor_base.py
+手册对应章节: ARCHITECTURE.md §3 (控制架构), STATE_MACHINE.md §2-9, CONTROL_SETPOINTS.md §2 (放电触发)
+
+系统级功率调度编排器: VSG/一次调频/直流母线恒压/充放电管理。负责两套符号约定的转换。
 """
 import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 from control_algorithms import MotorModelParams, CurrentState
+from motor_base import HIMMotor, HIMConfig
+from sic_md_inverter import SiCMachineInverter, FidelityLevel, ExciterBuckConverter
 
 
 class PowerMode(Enum):
@@ -41,14 +48,14 @@ class VSGController:
 
     def __init__(self, J_virtual: float = 10.0, D_damping: float = 50.0,
                  droop_p: float = 0.04,  # 4% 下垂
-                 P_nom: float = 500e3):
+                 P_nom: float = 500e3, ts: float = 50e-6):
         self.J = J_virtual          # 虚拟惯量 kg·m² (等效)
         self.D = D_damping          # 阻尼系数 Nm·s/rad
         self.droop_p = droop_p      # 有功下垂系数
         self.P_nom = P_nom          # 额定功率
         self._omega_v = 2 * math.pi * 50  # 虚拟角速度
         self._theta_v = 0.0         # 虚拟功角
-        self._Ts = 50e-6
+        self._Ts = ts
 
     def compute(self, f_grid: float, SOC: float, P_schedule: float = 0.0) -> dict:
         """
@@ -98,12 +105,12 @@ class FrequencyRegulator:
     """一次调频控制器 (droop + 惯量)"""
 
     def __init__(self, droop: float = 0.04, deadband: float = 0.02,
-                 P_max: float = 500e3):
+                 P_max: float = 500e3, ts: float = 50e-6):
         self.droop = droop          # 4% 下垂
         self.deadband = deadband    # 死区 Hz (±0.02Hz)
         self.P_max = P_max
         self._f_last = 50.0
-        self._Ts = 50e-6
+        self._Ts = ts
 
     def compute(self, f_grid: float, SOC: float) -> float:
         """返回调频功率 W (正=放电支持电网, 负=充电吸收)"""
@@ -141,12 +148,12 @@ class DCBusController:
     """
 
     def __init__(self, C_bus: float = 0.2, Vdc_nom: float = 750.0,
-                 mode: str = 'ff_pi'):
+                 mode: str = 'ff_pi', ts: float = 50e-6):
         self.C = C_bus
         self.V_nom = Vdc_nom
         self.mode = mode
         self._integral = 0.0
-        self._Ts = 50e-6
+        self._Ts = ts
         
         # PI 增益
         self.Kp = 20.0
@@ -302,6 +309,7 @@ class PowerOrchestrator:
                  P_nom: float = 500e3,
                  motor=None,        # MotorBase (全链路用)
                  current_ctrl=None, # ControllerBase (全链路用)
+                 ts: float = 50e-6,
                  ):
         self.fw = flywheel
         self.grid = grid
@@ -310,13 +318,13 @@ class PowerOrchestrator:
         self.ctrl = current_ctrl
         
         # 子控制器
-        self.vsg = VSGController(P_nom=P_nom)
-        self.freq_reg = FrequencyRegulator(P_max=P_nom)
-        self.dc_ctrl = DCBusController(Vdc_nom=750.0)
+        self.vsg = VSGController(P_nom=P_nom, ts=ts)
+        self.freq_reg = FrequencyRegulator(P_max=P_nom, ts=ts)
+        self.dc_ctrl = DCBusController(Vdc_nom=750.0, ts=ts)
         
         self.state = PowerControlState()
         self._mode = PowerMode.IDLE
-        self._Ts = 50e-6
+        self._Ts = ts
         
         # SOC 监测
         self._soc_history = []
@@ -324,7 +332,9 @@ class PowerOrchestrator:
         
     @property
     def use_full_chain(self):
-        """是否走完整链路 (电机+电流控制)"""
+        """是否走完整链路 (电机+电流控制或HIM自带控制器)"""
+        if isinstance(self.motor, HIMMotor):
+            return True  # HIM 自带励磁控制器
         return self.motor is not None and self.ctrl is not None
 
     @property
@@ -416,7 +426,10 @@ class PowerOrchestrator:
         self.fw.step(P_fly, Vdc)
 
     def _step_full_chain(self, P_fly: float, Vdc: float):
-        """全链路模式: P→T→Iq_ref→电流控制→电机→飞轮"""
+        """全链路模式: P→T→Iq_ref→电流控制→电机→飞轮
+        
+        v2.1: 支持 HIM 感应子电机 (励磁绕组 + Vf 控制)
+        """
         motor = self.motor
         ctrl = self.ctrl
         ms = motor.state
@@ -428,28 +441,105 @@ class PowerOrchestrator:
         T_max = self.P_nom / omega
         T_ref = max(-T_max, min(T_max, T_ref))
 
-        # 2. 转矩 → Iq 参考 (FOC: Te = 1.5*P*ψm*Iq)
+        # ── HIM 分支: 使用 HIMController 处理励磁 ──
+        if isinstance(motor, HIMMotor):
+            self._step_him(P_fly, Vdc, T_ref, omega)
+            return
+
+        # ── PMSM/IM 分支 (原逻辑) ──
+        # 2. 转矩 → Iq 参考
         P = motor.cfg.P
         psi_m = getattr(motor.cfg, 'psi_m', 0.07) or 0.07
         Iq_ref = T_ref / (1.5 * P * psi_m)
         Iq_ref = max(-motor.cfg.I_max, min(motor.cfg.I_max, Iq_ref))
-        Id_ref = 0.0  # Id=0 控制
+        Id_ref = 0.0
 
-        # 3. 电流控制器 → Vd, Vq
+        # 3. 电流控制器
         state = CurrentState(Id=ms.Id, Iq=ms.Iq, omega_m=fw.state.omega, Vdc=Vdc)
         Vd, Vq = ctrl.compute(Id_ref, Iq_ref, state)
 
         # 4. 驱动电机
         motor.step(Vd, Vq)
 
-        # 5. 飞轮转速 = 电机机械转速
-        fw.state.omega = ms.omega_m
-        fw.state.Te = T_ref
+        # 5. 同步飞轮
+        fw.sync_from_motor(ms.omega_m, T_ref, Vdc)
 
-        # 6. 更新飞轮 SOC (转速驱动)
-        fw.step(0, Vdc)
+    def _step_him(self, P_fly: float, Vdc: float, T_ref: float, omega: float):
+        """HIM 感应子电机全链路步进 — 含 SiC 逆变器硬件模型
+
+        链路: HIMController → SiC逆变器(DC→AC) → HIMMotor
+              ExciterBuck → 励磁绕组 Vf
+        """
+        motor = self.motor
+        fw = self.fw
+        ms = motor.state
+
+        # 懒加载 HIM 控制器 + SiC 逆变器 + 励磁 Buck
+        if not hasattr(self, '_him_ctrl'):
+            from him_controller import HIMController
+            self._him_ctrl = HIMController(motor.cfg, dt=self._Ts)
+            self._him_pre_excited = False
+            # SiC 机侧逆变器 (SVPWM Level)
+            self._sic_inv = SiCMachineInverter(fidelity=FidelityLevel.SVPWM)
+            self._sic_inv.cfg.Vdc_nom = motor.cfg.Vdc_nom
+            # 励磁 Buck
+            self._exciter = ExciterBuckConverter()
+
+        him = self._him_ctrl
+        sic = self._sic_inv
+        exc = self._exciter
+
+        # 预励磁 (复位后重新执行)
+        if not self._him_pre_excited:
+            Vf_full = motor.cfg.If_nom * motor.cfg.Rf
+            for _ in range(int(0.05 / self._Ts)):
+                motor.step(0, 0, self._Ts, Vf=Vf_full)
+            self._him_pre_excited = True
+
+        # 转矩 → Iq 参考
+        Mdf = motor.Mdf
+        If_cur = max(ms.If, 0.1)
+        Iq_ref = T_ref / (1.5 * motor.cfg.P * Mdf * If_cur)
+        Iq_ref = max(-motor.cfg.I_max, min(motor.cfg.I_max, Iq_ref))
+
+        # 励磁管理
+        if_ext = motor.cfg.If_nom if abs(T_ref) > 0.5 else 0.0
+
+        # ═══ HIM 控制器 → Vd/Vq 参考 ═══
+        Vd_ref, Vq_ref, Vf_ref = him.update(
+            omega_ref=fw.state.omega, omega_fb=fw.state.omega,
+            id_fb=ms.Id, iq_fb=ms.Iq, if_fb=ms.If,
+            if_ext=if_ext, iq_ext=Iq_ref,
+        )
+
+        # ═══ SiC 逆变器: Vd/Vq 参考 → 实际电压 (含 SVPWM/死区/压降) ═══
+        theta_e = ms.theta_e
+        Vd_act, Vq_act, inv_diag = sic.apply(
+            Vd_ref, Vq_ref, theta_e, Vdc,
+            id_fb=ms.Id, iq_fb=ms.Iq, dt=self._Ts,
+        )
+        self._inv_diag = inv_diag  # 暴露给外部读取
+
+        # ═══ 励磁 Buck: Vf_ref → 实际 Vf ═══
+        Vf_act, _ = exc.step(Vf_ref, ms.If, self._Ts)
+
+        # ═══ 驱动电机 ═══
+        motor.step(Vd_act, Vq_act, self._Ts, Vf=Vf_act)
+
+        # 同步飞轮
+        fw.sync_from_motor(ms.omega_m, T_ref, Vdc)
 
     # ═══════ SOC 监测 ═══════
+    def reset(self):
+        """复位所有内部状态 (含 HIM 预励磁标志)"""
+        self._soc_history.clear()
+        self._him_pre_excited = False
+        if hasattr(self, '_him_ctrl'):
+            self._him_ctrl.reset()
+        self.dc_ctrl.reset()
+        self.state = PowerControlState()
+        self._mode = PowerMode.IDLE
+
     def get_soc_status(self) -> dict:
         """SOC 综合状态"""
         soc = self.fw.state.SOC

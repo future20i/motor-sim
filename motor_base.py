@@ -1,15 +1,12 @@
 """
-motor_base.py — 电机模型基类 + 工厂函数
+motor_base.py — 5种电机统一接口: 单步仿真 step(Vd,Vq,dt) → MotorState。
 
-支持类型:
-  - pmsm:     永磁同步电机 (表贴式 / 内置式)
-  - induction: 鼠笼异步电机
-  - synrm:     同步磁阻电机
-  - pm_synrm:  永磁辅助同步磁阻电机
+子系统: 物理模型
+依赖: system_config.py (PhysicalConstants, FlywheelMotorSpec)
+手册对应章节: ARCHITECTURE.md §1.1 (系统部件概述), TELEMETRY.md §5 (电机遥测点)
 
-所有子类暴露统一接口: step(Vd, Vq, dt) → MotorState
+5种电机统一接口: 单步仿真 step(Vd,Vq,dt) → MotorState。
 """
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -40,6 +37,7 @@ class MotorState:
     temp: float = 25.0     # 温度 [°C]
     fault: FaultType = FaultType.NONE
     Te: float = 0.0        # 电磁转矩 [N·m]
+    If: float = 0.0        # 励磁电流 [A] (感应子电机专用, 其余电机忽略)
 
 
 # ═══════════════════════════════════════
@@ -459,6 +457,160 @@ class PMSynRM(MotorBase):
 
 
 # ═══════════════════════════════════════
+# 5. 单极感应子电机 HIM (Homopolar Inductor Machine)
+# ═══════════════════════════════════════
+
+@dataclass
+class HIMConfig(MotorConfig):
+    """感应子电机参数 — 电励磁, 转子无永磁体/无绕组
+
+    励磁绕组在定子侧, 通过互感 Mdf 在转子建立磁场。
+    核心优势: 可关闭励磁实现零损耗待机, 可降励磁实现弱磁扩速。
+    """
+    Ld: float = 0.002           # d 轴电感 [H]
+    Lq: float = 0.002           # q 轴电感 [H]
+    Mdf: float = 0.01           # 定转子互感 [H] (励磁→d轴)
+    Rf: float = 0.5             # 励磁绕组电阻 [Ω]
+    Lf: float = 0.1             # 励磁绕组电感 [H]
+    If_nom: float = 10.0        # 额定励磁电流 [A]
+    If_max: float = 10.0        # 最大励磁电流 [A]
+
+
+class HIMMotor(MotorBase):
+    """单极感应子电机 (Homopolar Inductor Machine)
+
+    状态: [Id, Iq, If, omega_m, theta_e]
+    控制输入: Vd, Vq, Vf
+
+    核心方程:
+      ψ_d = Ld·Id + Mdf·If    (d轴磁链含励磁贡献)
+      ψ_q = Lq·Iq
+      Te = 1.5·P·(ψ_d·Iq - ψ_q·Id)
+
+    弱磁策略:
+      1. 优先降 If → 直接降反电动势 (感应子独有优势)
+      2. If=0 后注入负 Id → 压榨最后转速
+    """
+
+    def __init__(self, config: HIMConfig = None, fidelity: str = "level1"):
+        cfg = config or HIMConfig()
+        super().__init__(cfg, fidelity)
+        self._Vf = 0.0           # 励磁电压
+        self._flux_weakening = False
+        self._voltage_util = 0.0  # 电压利用率
+
+    @property
+    def Ld(self): return self.cfg.Ld
+    @property
+    def Lq(self): return self.cfg.Lq
+    @property
+    def Mdf(self): return self.cfg.Mdf
+    @property
+    def Rf(self): return self.cfg.Rf
+    @property
+    def Lf(self): return self.cfg.Lf
+
+    def type_name(self): return "感应子电机 (HIM, 电励磁)"
+
+    def param_summary(self):
+        return {
+            "Rs": self.cfg.Rs, "Ld": self.Ld, "Lq": self.Lq,
+            "Mdf": self.Mdf, "Rf": self.Rf, "Lf": self.Lf,
+            "If_nom": self.cfg.If_nom, "P": self.cfg.P, "J": self.cfg.J,
+        }
+
+    def step(self, Vd: float, Vq: float, dt: float = None,
+             Vf: float = None) -> MotorState:
+        """HIM 步进 — 4 状态 RK4 积分"""
+        dt = dt or self.cfg.T_sample
+        if Vf is not None:
+            self._Vf = Vf
+
+        s = self.state
+        x0 = np.array([s.Id, s.Iq, s.If, s.omega_m])
+
+        k1 = self._derivatives(x0, Vd, Vq, self._Vf)
+        k2 = self._derivatives(x0 + 0.5 * dt * k1, Vd, Vq, self._Vf)
+        k3 = self._derivatives(x0 + 0.5 * dt * k2, Vd, Vq, self._Vf)
+        k4 = self._derivatives(x0 + dt * k3, Vd, Vq, self._Vf)
+        x_new = x0 + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        s.Id = x_new[0]
+        s.Iq = x_new[1]
+        s.If = max(0.0, x_new[2])
+        s.omega_m = max(0.0, x_new[3])
+
+        I_peak = np.sqrt(s.Id**2 + s.Iq**2)
+        if I_peak > self.cfg.I_max:
+            s.Id *= self.cfg.I_max / I_peak
+            s.Iq *= self.cfg.I_max / I_peak
+        s.If = min(s.If, self.cfg.If_max)
+
+        psi_d = self.Ld * s.Id + self.Mdf * s.If
+        psi_q = self.Lq * s.Iq
+        s.Te = 1.5 * self.cfg.P * (psi_d * s.Iq - psi_q * s.Id)
+
+        omega_e = self.cfg.P * s.omega_m
+        s.theta_e += omega_e * dt
+        s.theta_e %= 2 * np.pi
+
+        if self.fidelity == "level2":
+            P_loss = self.cfg.Rs * (s.Id**2 + s.Iq**2) + self.Rf * s.If**2
+            dT = (P_loss - (s.temp - self.temp_ambient) / 0.05) / 500
+            s.temp += dT * dt
+
+        omega_fb = s.omega_m
+        Vd_est = -omega_fb * self.Lq * s.Iq
+        Vq_est = omega_fb * (self.Ld * s.Id + self.Mdf * s.If)
+        V_mag = np.sqrt(Vd_est**2 + Vq_est**2)
+        self._voltage_util = V_mag / (self.cfg.Vdc_nom / np.sqrt(3)) if self.cfg.Vdc_nom > 0 else 0
+
+        if I_peak >= 1.2 * self.cfg.I_max:
+            s.fault = FaultType.OVERCURRENT
+        if s.temp > 150:
+            s.fault = FaultType.OVERTEMP
+
+        return s
+
+    def _derivatives(self, x, Vd, Vq, Vf):
+        id_, iq_, i_f, omega = x
+        cfg = self.cfg
+        psi_d = self.Ld * id_ + self.Mdf * i_f
+        psi_q = self.Lq * iq_
+        did_dt = (Vd - cfg.Rs * id_ + omega * psi_q) / self.Ld
+        diq_dt = (Vq - cfg.Rs * iq_ - omega * psi_d) / self.Lq
+        dif_dt = (Vf - self.Rf * i_f) / self.Lf
+        Te = 1.5 * cfg.P * (psi_d * iq_ - psi_q * id_)
+        domega_dt = (Te - self.load_torque - cfg.B * omega) / cfg.J
+        return np.array([did_dt, diq_dt, dif_dt, domega_dt])
+
+    def _electrical_dynamics(self, Vd, Vq):
+        raise NotImplementedError("HIM uses step() directly with 4-state RK4")
+
+    def _compute_torque(self):
+        s = self.state
+        psi_d = self.Ld * s.Id + self.Mdf * s.If
+        psi_q = self.Lq * s.Iq
+        return 1.5 * self.cfg.P * (psi_d * s.Iq - psi_q * s.Id)
+
+    @property
+    def flux_weakening(self) -> bool:
+        return self._flux_weakening
+
+    @property
+    def voltage_utilization(self) -> float:
+        return self._voltage_util
+
+    def get_readable(self) -> dict:
+        d = super().get_readable()
+        d["If"] = round(self.state.If, 3)
+        d["Vf"] = round(self._Vf, 2)
+        d["flux_weak"] = self._flux_weakening
+        d["V_util"] = round(self._voltage_util, 3)
+        return d
+
+
+# ═══════════════════════════════════════
 # 工厂函数
 # ═══════════════════════════════════════
 
@@ -477,6 +629,7 @@ def create_motor(motor_type: str, fidelity: str = "level1", **kwargs) -> MotorBa
         "induction": (InductionConfig, InductionMotor),
         "synrm":     (SynRMConfig, SynRM),
         "pm_synrm":  (PMSynRMConfig, PMSynRM),
+        "him":       (HIMConfig, HIMMotor),
     }
 
     if motor_type not in mapping:
@@ -495,4 +648,31 @@ def list_motor_types() -> list:
         {"id": "induction", "name": "鼠笼异步电机",        "params": ["Rs", "Rr", "Ls", "Lr", "Lm", "P", "J"]},
         {"id": "synrm",     "name": "同步磁阻电机",        "params": ["Rs", "Ld", "Lq", "P", "J"]},
         {"id": "pm_synrm",  "name": "永磁辅助同步磁阻电机",  "params": ["Rs", "Ld", "Lq", "psi_m", "P", "J"]},
+        {"id": "him",       "name": "单极感应子电机(HIM)",   "params": ["Rs", "Ld", "Lq", "Mdf", "Rf", "Lf", "If_nom", "P", "J"]},
     ]
+
+
+# ═══════════════════════════════════════
+# 向后兼容别名 (pmsm_model.py 已合并到此文件)
+# ═══════════════════════════════════════
+MotorParams = PMSMConfig
+PMSMotor = PMSM
+
+
+def create_pmsm_motor(params=None, fidelity: str = "level1"):
+    """向后兼容工厂函数 — 替代已删除的 pmsm_model.py"""
+    if params is None:
+        return PMSM(fidelity=fidelity)
+    cfg = PMSMConfig(
+        Rs=getattr(params, 'Rs', 0.005),
+        Ld=getattr(params, 'Ld', 0.002),
+        Lq=getattr(params, 'Lq', 0.002),
+        psi_m=getattr(params, 'psi_m', 0.08),
+        P=getattr(params, 'P', 6),
+        J=getattr(params, 'J', 0.04),
+        B=getattr(params, 'B', 0.0005),
+        I_max=getattr(params, 'I_max', 100.0),
+        Vdc_nom=getattr(params, 'Vdc_nom', 750.0),
+        T_sample=getattr(params, 'T_sample', 50e-6),
+    )
+    return PMSM(cfg, fidelity=fidelity)

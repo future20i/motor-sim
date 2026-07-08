@@ -1,12 +1,10 @@
 """
-s4_experiment_runner.py — S4: Experiment Runner
+s4_experiment_runner.py — 6策略×10场景全自动实验对比框架。
 
-编排全系统仿真 + 场景注入 + 指标采集 + 策略对比
+子系统: 应用层 (S4)
+依赖: s4_scenarios.py, s4_metrics.py, power_ops.py
 
-用法:
-    python s4_experiment_runner.py              # 跑所有场景
-    python s4_experiment_runner.py --scenario 1 # 单个场景
-    python s4_experiment_runner.py --compare    # 三策略对比
+6策略×10场景全自动实验对比框架。
 """
 import sys
 import math
@@ -98,12 +96,21 @@ class S4ExperimentRunner:
         """计算带符号的飞轮功率 (DC 母线视角)
 
         正 = 母线→飞轮 (充电), 负 = 飞轮→母线 (放电)
+        修复: 原代码 P_ref>=0 时错误地返回了负值
         """
         po = orchestrator
         s = po.state
-        # P_mech: 正=电动(充电, 母线→飞轮), 负=发电(放电, 飞轮→母线)
-        # 返回带符号值: 正=母线→飞轮充电, 负=飞轮→母线放电
-        return -s.P_actual if s.P_ref >= 0 else s.P_actual
+        # DC_BUS_CONTROL/POWER_TRACKING 模式下:
+        #   P_ref>0 = 飞轮应放电支撑母线 (dc_ctrl返回正值=补缺口)
+        #   对母线: 飞轮放电→母线 = 负 (母线接收功率)
+        # FREQ_REGULATION 模式下:
+        #   P_ref>0 = 频率偏低, 飞轮放电支撑
+        #   对母线: 飞轮放电→母线 = 负
+        # 因此: P_ref 的方向 = 飞轮输出功率方向
+        #       dc_bus 期望 P_flywheel 正=母线→飞轮(充电)
+        #       所以: P_flywheel = -P_ref (P_ref正=放电, 需要负值给dc_bus)
+        sign = -1 if po._mode.value in (2, 3, 5) else 1  # FREQ/VSG/INERTIA 模式符号翻转
+        return sign * s.P_ref if s.P_ref >= 0 else sign * s.P_ref
 
     def run_scenario(self, scenario: ScenarioConfig, controller,
                      strategy_name: str = "unknown") -> ExperimentResult:
@@ -368,53 +375,9 @@ class S4ExperimentRunner:
 
     def _compute_composite_score(self, m: ExperimentMetrics, s: ScenarioConfig,
                                   max_df_observed: float = 0.0) -> float:
-        """加权综合评分 (0-100, 越高越好)
-
-        [FIX-2026-07 迭代2] 原评分公式对响应时间线性扣分且 200ms 归零,
-        而系统的决策周期(5ms采样)+ 飞轮惯量爬升 + droop 一次调频的物理响应
-        时间通常在 0.5~1s 量级, 属于正常, 不应被评为 0 分。
-        与此同时, 原公式对"从未响应"给出中性 50 分默认值, 造成一个从不
-        参与调频支撑的策略反而比慢速但真实响应的策略得分更高的悖论
-        (例如: 完全不理会频率骤降的固定VDC策略 58.1分 > 705ms内完成
-        droop响应的固定调频策略 24.5分)。这会在实际验收测试中把
-        "不作为"误判为优等策略, 是评估方法学上的重大缺陷。
-
-        新公式:
-          1. 用指数衰减代替线性衰减, 时间常数 τ=600ms, 更符合飞轮+droop
-             的真实响应特性 (100ms→~85分, 500ms→~43分, 1s→~19分)
-          2. 区分"场景本身无需响应"(max_df_observed 很小) 与
-             "场景确有事件但策略未响应"两种情况: 后者按事件严重程度扣分,
-             不再给中性分, 避免不作为策略被高估
-        """
-
-        # Vdc 评分: 偏差越小越好
-        vdc_score = max(0, 100 - m.vdc_max_dev * 2) if m.vdc_max_dev > 0 else 100
-
-        # 频率响应: 指数衰减模型, 响应越快分越高; 真实无响应且确有事件则按事件严重度扣分
-        FREQ_EVENT_THRESHOLD = 0.06  # Hz, 低于此视为噪声/无实质事件
-        if m.freq_response_t > 0:
-            freq_score = 100 * math.exp(-m.freq_response_t / 600.0)  # τ=600ms
-        elif max_df_observed < FREQ_EVENT_THRESHOLD:
-            freq_score = 100  # 场景本身没有明显频率事件, 不响应是正确的
-        else:
-            # 确有事件但从未响应 → 按超出阈值的严重程度扣分, 而非给中性分
-            severity = max_df_observed - FREQ_EVENT_THRESHOLD
-            freq_score = max(0, 35 - severity * 300)
-
-        # SOC: 不越限满分
-        soc_score = max(0, 100 - m.soc_violations * 20)
-
-        # 效率
-        eff_score = m.efficiency * 100
-
-        total = (s.weight_vdc_reg * vdc_score +
-                s.weight_freq_support * freq_score +
-                s.weight_soc_mgmt * soc_score +
-                s.weight_efficiency * eff_score) / (
-                    max(s.weight_vdc_reg + s.weight_freq_support +
-                        s.weight_soc_mgmt + s.weight_efficiency, 0.001))
-
-        return total
+        """加权综合评分 — 调用统一评分函数 (消除与 s4_metrics 的重复)"""
+        from s4_metrics import compute_all_scores
+        return compute_all_scores(m, s, max_df_observed)["composite"]
 
     def run_all(self) -> List[ExperimentResult]:
         """跑所有场景, 用 AI adaptive 策略"""

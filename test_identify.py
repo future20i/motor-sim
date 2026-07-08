@@ -1,11 +1,10 @@
 """
-test_identify.py — 模拟 AI 执行 PMSM 参数辨识
+test_identify.py — AI 参数辨识流程测试: Rs辨识 (自适应电压+等5τ)。
 
-启动仿真后运行此脚本，将自动执行:
-1. 定子电阻 Rs 辨识 (直流注入法)
-2. d轴电感 Ld 辨识 (高频注入法)
+子系统: 应用层测试 (S1)
+依赖: ai_commissioner.py, motor_base.py
 
-输出每个步骤的结果和与真值的误差。
+AI 参数辨识流程测试: Rs辨识 (自适应电压+等5τ)。
 """
 import asyncio
 import time

@@ -1,12 +1,11 @@
 """
-demo.py — 启动完整仿真栈 (多电机类型支持)
+demo.py — 基础演示脚本: PMSM飞轮全链路。
 
-用法:
-    python3 demo.py                          # PMSM 默认
-    python3 demo.py --motor induction        # 异步电机
-    python3 demo.py --motor synrm            # 同步磁阻电机
-    python3 demo.py --motor pm_synrm         # 永磁辅助磁阻电机
-    python3 demo.py --motor pmsm --level2    # PMSM + Level2 精度
+子系统: 应用层
+依赖: power_ops.py, grid_sim.py, system_config.py
+手册对应章节: INSTALLATION.md §4.1 (运行仿真)
+
+基础演示脚本: PMSM飞轮全链路。
 """
 import argparse
 import asyncio

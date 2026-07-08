@@ -1,6 +1,11 @@
 """
-dc_bus.py — 直流母线动态模型
-电容充放电 · 负载扰动 · 整流/逆变功率流 · 纹波
+dc_bus.py — C·dV/dt 电容动力学。功率符号: + = 充电 (母线→飞轮)。
+
+子系统: 物理模型
+依赖: system_config.py (DCBusSpec)
+手册对应章节: ARCHITECTURE.md §1.1, TELEMETRY.md §3 (直流母线遥测点)
+
+C·dV/dt 电容动力学。功率符号: + = 充电 (母线→飞轮)。
 """
 import math
 from dataclasses import dataclass
@@ -37,10 +42,10 @@ class DCBus:
     Ic = (P_rect - P_inv - P_load - I²R_esr) / Vdc
     """
 
-    def __init__(self, config: DCBusConfig = None):
+    def __init__(self, config: DCBusConfig = None, ts: float = 50e-6):
         self.cfg = config or DCBusConfig()
         self.state = DCBusState(Vdc=self.cfg.V_nom)
-        self._Ts = 50e-6
+        self._Ts = ts
 
     def step(self, P_rect: float, P_flywheel: float, P_load: float) -> DCBusState:
         """

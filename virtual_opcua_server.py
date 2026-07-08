@@ -1,8 +1,11 @@
 """
-virtual_opcua_server.py — 虚拟 OPC UA Server
+virtual_opcua_server.py — asyncua Server: 暴露 5写+15读 节点。真系统和仿真系统使用完全相同接口。
 
-暴露 S3+S4 状态给 AI，接口和真机 CODESYS 完全一致。
-AI 通过 OPC UA Client 连接 opc.tcp://localhost:4840，ns=4
+子系统: 通信层 (S2)
+依赖: 无
+手册对应章节: TELEMETRY.md §8 (OPC UA节点映射)
+
+asyncua Server: 暴露 5写+15读 节点。真系统和仿真系统使用完全相同接口。
 """
 import asyncio
 import time
@@ -47,6 +50,7 @@ class VirtualOpcuaServer:
             node = await objects.add_variable(ns, var_name, rule["default"])
             await node.set_writable(True)
             self.nodes[var_name] = node
+            self.last_values[var_name] = rule["default"]
 
         # 只读变量
         read_vars = [
@@ -58,13 +62,7 @@ class VirtualOpcuaServer:
             await node.set_writable(False)
             self.nodes[var_name] = node
 
-        # 写回调 → 映射到控制器
-        for var_name in self.write_rules:
-            node = await objects.get_child(f"{ns}:{var_name}")
-            node.add_writerequest_callback(
-                lambda h, val, n=var_name: self._on_write(n, val)
-            )
-
+        # 写处理: 在 _sim_loop 中主动轮询可写节点 (asyncua 无 add_writerequest_callback API)
         self._running = True
         asyncio.create_task(self._sim_loop())
         asyncio.create_task(self._heartbeat_check())
@@ -114,6 +112,19 @@ class VirtualOpcuaServer:
         dt = self.controller.ts
         step = 0
         while self._running:
+            # ── 轮询可写节点 (替代不存在的 add_writerequest_callback) ──
+            for var_name in self.write_rules:
+                try:
+                    node = self.nodes[var_name]
+                    val = await node.read_value()
+                    last = self.last_values.get(var_name)
+                    if last is not None and val != last:
+                        self._on_write(var_name, val)
+                        self.last_values[var_name] = val
+                except Exception:
+                    pass  # 节点未就绪时跳过
+
+            # ── 更新只读变量 ──
             readable = self.controller.run_cycle()
             for var, val in readable.items():
                 if var in self.nodes:

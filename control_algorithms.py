@@ -1,13 +1,11 @@
 """
-control_algorithms.py — 多算法电流控制器
+control_algorithms.py — 3种电流环: PI (前馈解耦) / Deadbeat (预测控制) / SlidingMode (滑模控制)。统一接口: compute(Id_ref, Iq_ref, state) → (Vd, Vq)。
 
-统一接口:
-  ControllerBase
-    ├── PIController      — PI 控制
-    ├── DeadbeatController — 无差拍预测控制
-    └── SlidingModeController — 滑模控制
+子系统: 控制层
+依赖: motor_base.py (MotorModelParams, CurrentState)
+手册对应章节: CONTROL_SETPOINTS.md §4 (电机控制参数)
 
-每个算法通过 compute(Vd_ref, Vq_ref, state, dt) → (Vd_out, Vq_out) 调用
+3种电流环: PI (前馈解耦) / Deadbeat (预测控制) / SlidingMode (滑模控制)。统一接口: compute(Id_ref, Iq_ref, state) → (Vd, Vq)。
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass

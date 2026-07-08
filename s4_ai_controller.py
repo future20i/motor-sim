@@ -1,16 +1,11 @@
 """
-s4_ai_controller.py — S4: AI Control Agent
+s4_ai_controller.py — AI 电网调度策略: 规则/自适应/预测模式, 8维观测→6动作决策。
 
-在功率编排层做智能决策：
-  1. 读取电网状态 (f, V, dV/dt, df/dt)
-  2. 选择控制模式 (IDLE/DC_BUS/FREQ/VSG/INERTIA)
-  3. 自适应调参 (droop, deadband, PI gains)
-  4. 预测性动作 (基于 RoCoF 提前响应)
+子系统: 应用层 (S4)
+依赖: power_ops.py
+手册对应章节: STATE_MACHINE.md §2-3
 
-支持三种策略:
-  - 'rule_based' : 专家规则 (确定性, 可解释)
-  - 'adaptive'   : 自适应增益调度
-  - 'predictive' : 预测 + 规则混合
+AI 电网调度策略: 规则/自适应/预测模式, 8维观测→6动作决策。
 """
 import math
 from dataclasses import dataclass

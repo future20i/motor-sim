@@ -1,8 +1,11 @@
 """
-ai_commissioner.py — S1: AI 调试助手
-Phase A: AI 建议, 人确认 · Phase B: 只读监控 · Phase C: 自主执行
+ai_commissioner.py — AI 电机调试助手: 参数辨识 (Rs→Ld/Lq→磁链→J) + PI自整定 + 故障诊断。
 
-电机参数辨识 + PI 自整定 + 故障诊断 + 工步调度
+子系统: 应用层 (S1)
+依赖: motor_base.py, control_algorithms.py
+手册对应章节: CONTROL_SETPOINTS.md §4, TELEMETRY.md §5
+
+AI 电机调试助手: 参数辨识 (Rs→Ld/Lq→磁链→J) + PI自整定 + 故障诊断。
 """
 import math
 import numpy as np
@@ -227,7 +230,10 @@ class AICommissioner:
 
     # ═══════ 完整调试序列 ═══════
     def build_full_sequence(self):
-        """构建完整调试序列 (Phase A: 每步需人确认)"""
+        """构建完整调试序列 (Phase A: 每步需人确认)
+        
+        修复: identify_rs 增加前一步成功检查，避免用失败数据继续
+        """
         self.sequence = [
             CommissionStep("precharge", "预充直流母线到 90% 额定电压",
                           lambda: self.precharge(0.9),
@@ -239,11 +245,14 @@ class AICommissioner:
 
             CommissionStep("identify_rs", "两点差分+瞬态修正辨识 Rs (依赖 Ld)",
                           lambda: self.identify_rs(),
-                          lambda: "Ld" in self.identified),
+                          lambda: ("Ld" in self.identified
+                                   and self.sequence[1].status == "done")),
 
             CommissionStep("auto_tune", "基于辨识结果自动计算 PI 增益",
                           lambda: self.auto_tune_pi(),
-                          lambda: "Ld" in self.identified),
+                          lambda: ("Ld" in self.identified
+                                   and self.sequence[1].status == "done"
+                                   and "Rs" in self.identified)),
 
             CommissionStep("verify", "诊断当前状态, 检查异常",
                           lambda: self.diagnose(),

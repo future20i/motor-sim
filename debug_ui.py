@@ -1,6 +1,11 @@
 """
-debug_ui.py v7.2 — Scope Mode
-st.empty() 原地刷新 · 仿真循环底部 · 无 fragment
+debug_ui.py — Streamlit 调试 UI: 六状态 + 实时KPI + 波形 + 参数辨识 + 故障注入。
+
+子系统: 应用层
+依赖: power_ops.py, motor_base.py, system_config.py
+手册对应章节: INSTALLATION.md §4.4
+
+Streamlit 调试 UI: 六状态 + 实时KPI + 波形 + 参数辨识 + 故障注入。
 """
 import streamlit as st
 import numpy as np
@@ -78,10 +83,20 @@ def rebuild():
     log(f"Rebuild {mt}/{it}/{at}","ok")
 if "motor" not in st.session_state: rebuild()
 
-def abc_from_dq(Id,Iq,theta):
-    c,s=math.cos(theta),math.sin(theta)
-    a=c*Id-s*Iq
-    return a,-0.5*a+math.sqrt(3)/2*(s*Id+c*Iq),-a-(-0.5*a+math.sqrt(3)/2*(s*Id+c*Iq))
+def dq_to_abc(d: float, q: float, theta: float):
+    """逆 Park + 逆 Clarke (amplitude-invariant) — 修正版"""
+    c, s = math.cos(theta), math.sin(theta)
+    # 逆 Park: dq → αβ
+    alpha = c * d - s * q
+    beta  = s * d + c * q
+    # 逆 Clarke: αβ → abc (amplitude-invariant)
+    a = alpha
+    b = -0.5 * alpha + (math.sqrt(3) / 2) * beta
+    c_ = -0.5 * alpha - (math.sqrt(3) / 2) * beta
+    return a, b, c_
+
+# 向后兼容别名
+abc_from_dq = dq_to_abc
 
 # ═══════ 侧边栏 ═══════
 with st.sidebar:

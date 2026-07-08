@@ -1,7 +1,10 @@
 """
-test_all_motors.py — 验证所有电机类型
+test_all_motors.py — 5种电机类型全量测试: PMSM/IM/SynRM/PM-SynRM/HIM。
 
-运行: .venv/bin/python test_all_motors.py
+子系统: 应用层测试
+依赖: motor_base.py, control_algorithms.py
+
+5种电机类型全量测试: PMSM/IM/SynRM/PM-SynRM/HIM。
 """
 import numpy as np
 from motor_base import create_motor, list_motor_types

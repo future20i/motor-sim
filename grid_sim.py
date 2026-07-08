@@ -1,6 +1,11 @@
 """
-grid_sim.py — 电网仿真模型
-三相电网 · 频率偏差 · 电压波动 · 相位跳变 · 故障注入
+grid_sim.py — 三相电网仿真: 频率/电压/相位扰动 + 故障注入。
+
+子系统: 物理模型
+依赖: system_config.py (PhysicalConstants)
+手册对应章节: ARCHITECTURE.md §1.1, TELEMETRY.md §1 (三相遥测点)
+
+三相电网仿真: 频率/电压/相位扰动 + 故障注入。
 """
 import math
 import random
@@ -52,14 +57,14 @@ class GridState:
 class GridSimulator:
     """电网仿真器 — 含频率/电压波动和故障"""
 
-    def __init__(self, config: GridConfig = None):
+    def __init__(self, config: GridConfig = None, ts: float = 50e-6):
         self.cfg = config or GridConfig()
         self.state = GridState(f=self.cfg.f_nom, V_rms=self.cfg.V_nom)
         self._f_target = self.cfg.f_nom
         self._f_ramp = 0.0       # 当前频率变化率
         self._v_scale = 1.0      # 电压标度
         self._fault_timer = 0.0  # 故障倒计时
-        self._Ts = 50e-6
+        self._Ts = ts
 
     def step(self, dt: float = None) -> GridState:
         """一个仿真步进"""

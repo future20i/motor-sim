@@ -1,10 +1,13 @@
 """
-flywheel_energy.py — 飞轮储能系统模型
-E = ½Jω²  ·  SOC  ·  功率流  ·  损耗  ·  热模型
-泓慧能源 500kW/3kWh 飞轮UPS — 30Cr42MoV钢转子, 8800rpm@33.9kg·m²
+flywheel_energy.py — E = ½Jω², SOC, 功率流, 损耗, 热模型。功率符号: + = 充电 (电网→飞轮)。泓慧 500kW/3kWh — 30Cr42MoV钢转子, 8800rpm@33
+
+子系统: 物理模型
+依赖: system_config.py (FlywheelMechanicalSpec)
+手册对应章节: ARCHITECTURE.md §1.1, TELEMETRY.md §4 (飞轮遥测点), STATE_MACHINE.md §3 (ONLINE子状态)
+
+E = ½Jω², SOC, 功率流, 损耗, 热模型。功率符号: + = 充电 (电网→飞轮)。泓慧 500kW/3kWh — 30Cr42MoV钢转子, 8800rpm@33.9kg·m²。
 """
 import math
-import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -45,7 +48,7 @@ class FlywheelConfig:
     Rf: float = 75.0           # 励磁绕组电阻 Ω
     If_nom: float = 10.0       # 额定励磁电流 A
     Lf: float = 5.0            # 励磁绕组电感 H
-    # 励磁功率 P_exc = If²·Rf = 7.5kW (DC 母线取电, 恒定开销)
+    # P_exc = If²·Rf = 7.5kW (DC 母线取电, 恒定开销)
 
     # ── 损耗系数 (⚠️ 需台架数据标定) ──
     k_windage: float = 0.0     # 风阻系数 (真空腔, 近似为零)
@@ -95,12 +98,38 @@ class FlywheelState:
 
 
 class FlywheelEnergyStorage:
-    """飞轮储能系统 — 物理模型"""
+    """飞轮储能系统 — 纯物理模型 (不涉及功率调度)
 
-    def __init__(self, config: FlywheelConfig = None):
-        self.cfg = config or FlywheelConfig()
+    v2.0: 接受 SystemConfig 或 FlywheelConfig。
+    从 SystemConfig 构造时自动从统一配置源取参数。
+    """
+
+    def __init__(self, config: FlywheelConfig = None, system_config=None):
+        if system_config is not None:
+            # 优先从 SystemConfig 构造
+            self.cfg = system_config.to_flywheel_config()
+            self._Ts = system_config.constants.Ts
+        elif config is not None:
+            self.cfg = config
+            self._Ts = 50e-6
+        else:
+            self.cfg = FlywheelConfig()
+            self._Ts = 50e-6
+
         self.state = FlywheelState()
-        self._Ts = 50e-6  # 仿真步长 50μs
+        self._validate_config()
+
+    def _validate_config(self):
+        """配置自检: 储能是否匹配额定值"""
+        E_usable = (0.5 * self.cfg.J *
+                    (self.cfg.omega_max_rad**2 - self.cfg.omega_min_rad**2))
+        E_usable_kWh = E_usable / 3.6e6
+        if abs(E_usable_kWh - 3.0) > 1.0:
+            import warnings
+            warnings.warn(
+                f"储能不匹配: J={self.cfg.J}kg·m², "
+                f"ω={self.cfg.omega_max}-{self.cfg.omega_min}rpm → "
+                f"可用={E_usable_kWh:.1f}kWh (额定=3.0kWh)")
 
     @property
     def rpm(self) -> float:
@@ -108,12 +137,10 @@ class FlywheelEnergyStorage:
 
     def step(self, P_grid: float, Vdc: float) -> FlywheelState:
         """
-        一个仿真步进
-        P_grid: 电网侧需求功率 (正=吸收, 负=释放)
-        Vdc: 直流母线电压
+        一个仿真步进 (物理模型, 不包含功率调度逻辑)
 
-        电机侧功率 = P_grid - P_losses
-        转矩 = P_motor / omega (限幅)
+        P_grid: 电网侧需求功率 W (正=从电网取电充电, 负=向电网放电)
+        Vdc:    直流母线电压 V
         """
         cfg = self.cfg
         s = self.state
@@ -129,7 +156,7 @@ class FlywheelEnergyStorage:
 
         # 2. 充放电限幅 (带 Vdc 降额: Vdc<80%时功率降至50%)
         vdc_factor = 1.0 if Vdc > 0.8 * cfg.Vdc_nom else max(0.3, Vdc / (0.8 * cfg.Vdc_nom) * 0.5)
-        P_max_charge = cfg.P_peak * vdc_factor   # 峰值功率用于瞬时限幅
+        P_max_charge = cfg.P_peak * vdc_factor
         P_max_discharge = cfg.P_peak * vdc_factor
 
         # 转速边界保护: 超速只能放电, 欠速只能充电
@@ -141,15 +168,14 @@ class FlywheelEnergyStorage:
             P_grid = max(P_grid, 0)  # 欠速: 强制充电
 
         P_grid = max(-P_max_discharge, min(P_max_charge, P_grid))
-        # P_grid: 正值=从电网取电(充电), P_motor = P_grid - P_losses
-        # 电机电磁功率 = P_grid - 机电损耗(含轴承/风阻)
+
+        # 电机电磁功率 = P_grid - 机电损耗
         P_motor = P_grid - s.P_loss
 
-        # 3. 动力学: J·dω/dt = Te (电磁转矩, 正=加速/充电)
+        # 3. 动力学: J·dω/dt = Te
         if abs(s.omega) > 0.1:
             T_motor = P_motor / s.omega
         else:
-            # 低速: 使用平滑分母避免奇点
             omega_sign = 1.0 if s.omega >= 0 else -1.0
             T_motor = P_motor / (0.1 * omega_sign)
 
@@ -157,10 +183,9 @@ class FlywheelEnergyStorage:
         T_motor = max(-T_max, min(T_max, T_motor))
         s.Te = T_motor
 
-        # 4. 机械积分: J·dω/dt = Te
+        # 4. 机械积分
         domega = T_motor / cfg.J
         s.omega += domega * Ts
-        # 下限: 不允许负转速 (飞轮不反转)
         s.omega = max(0.0, min(cfg.omega_max_rad, s.omega))
         s.theta += s.omega * Ts
         s.P_mech = T_motor * s.omega
@@ -174,15 +199,15 @@ class FlywheelEnergyStorage:
         else:
             s.SOC = 0.5
 
-        # 6. 热模型: 铜耗基于电磁功率, 不是净输出
-        P_copper = abs(T_motor * s.omega) * 0.02  # 2% 铜耗 (基于电磁功率)
+        # 6. 热模型
+        P_copper = abs(T_motor * s.omega) * 0.02  # 2% 铜耗
         P_heat = abs(s.P_loss) + P_copper
         dT = (P_heat - (s.temp - cfg.T_ambient) / cfg.R_thermal) / cfg.C_thermal
         s.temp += dT * Ts
 
-        # 7. 模式判定 (不覆盖转速保护状态)
+        # 7. 模式判定
         if s.omega >= cfg.omega_overspeed_rad or s.omega <= cfg.omega_min_rad:
-            pass  # 保持边界状态, 不覆盖
+            pass  # 保持边界状态
         elif abs(P_motor) < 100:
             s.mode = "idle"
         elif P_motor > 0:
@@ -190,8 +215,40 @@ class FlywheelEnergyStorage:
         else:
             s.mode = "discharging"
 
-        # 存储 Vdc (由逆变器决定, 这里记录)
         s.Vdc = Vdc
+        return s
+
+    # ── 转速同步更新 (全链路模式用, 不重复计算损耗) ──
+    def sync_from_motor(self, omega_m: float, Te: float, Vdc: float):
+        """从电机模型同步转速和转矩, 只更新 SOC/热模型, 不重复 step()"""
+        cfg = self.cfg
+        s = self.state
+        Ts = self._Ts
+
+        s.omega = omega_m
+        s.Te = Te
+        s.E_stored = 0.5 * cfg.J * s.omega ** 2
+
+        E_max = cfg.E_max_joules
+        E_min = 0.5 * cfg.J * cfg.omega_min_rad ** 2
+        if E_max > E_min:
+            s.SOC = max(0.0, min(1.0, (s.E_stored - E_min) / (E_max - E_min)))
+
+        s.P_mech = Te * s.omega
+        s.Vdc = Vdc
+
+        # 热模型
+        P_heat = abs(s.P_loss)
+        dT = (P_heat - (s.temp - cfg.T_ambient) / cfg.R_thermal) / cfg.C_thermal
+        s.temp += dT * Ts
+
+        # 模式
+        if abs(Te * s.omega) < 100:
+            s.mode = "idle"
+        elif Te > 0:
+            s.mode = "charging"
+        else:
+            s.mode = "discharging"
 
         return s
 
@@ -211,3 +268,7 @@ class FlywheelEnergyStorage:
             "If_A": s.If,
             "Vdc": s.Vdc,
         }
+
+    def set_ts(self, ts: float):
+        """覆盖仿真步长 (从 SystemConfig 统一设置)"""
+        self._Ts = ts

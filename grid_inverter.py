@@ -1,6 +1,11 @@
 """
-grid_inverter.py — 网侧逆变器
-双向 AC/DC · 预充 · VSG · PQ 控制 · 直流母线稳压 · PLL 锁相
+grid_inverter.py — 双向 AC/DC, 4种模式: PRECHARGE/SYNC/VSG/PQ_CONTROL/VDC_CONTROL, SRF-PLL 锁相。
+
+子系统: 控制层
+依赖: grid_sim.py, control_algorithms.py
+手册对应章节: ARCHITECTURE.md §1.1 §3 (双变流器架构), TELEMETRY.md §1-2
+
+双向 AC/DC, 4种模式: PRECHARGE/SYNC/VSG/PQ_CONTROL/VDC_CONTROL, SRF-PLL 锁相。
 """
 import math
 from dataclasses import dataclass, field

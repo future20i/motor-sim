@@ -1,24 +1,10 @@
 """
-s4_metrics.py — v2.0 实战评分体系
+s4_metrics.py — v2
 
-从「单点标量排名」升级为「工程决策依据」:
-  1. 硬约束一票否决 (IEC 62040 / GB/T 安全边界)
-  2. 帕累托前沿分析 (多目标可视化, 识别被支配策略)
-  3. 蒙特卡洛鲁棒性评分 (参数扰动 → 均值+方差)
+子系统: 应用层 (S4)
+依赖: power_ops.py
 
-用法:
-    from s4_metrics import HardConstraints, ParetoAnalyzer, RobustnessScorer
-
-    # 硬约束
-    v = HardConstraints.check(result)
-    if v.failed:
-        print(f"不合格: {v.reason}")
-
-    # 帕累托
-    frontier = ParetoAnalyzer.analyze(all_results)
-
-    # 鲁棒性
-    stats = RobustnessScorer.monte_carlo(runner, scenario, strategy, n=100)
+v2.0 评分体系: 硬约束 + 帕累托前沿 + 蒙特卡洛验证。
 """
 import math
 import random
@@ -29,6 +15,55 @@ from collections import defaultdict
 
 from s4_scenarios import ExperimentMetrics, ScenarioConfig, ScenarioID
 from s4_ai_controller import AIStrategy
+
+
+# ═══════════════════════════════════════════
+# 0. 统一评分函数 — 全局唯一, 消除重复
+# ═══════════════════════════════════════════
+
+def compute_all_scores(m: ExperimentMetrics, s: ScenarioConfig,
+                       max_df_observed: float = 0.0) -> dict:
+    """统一评分函数 — s4_experiment_runner 和 s4_metrics 共用
+
+    返回: {"vdc", "freq", "soc", "eff", "composite"} 各维度 0-100 分
+    """
+    FREQ_THRESHOLD = 0.06  # Hz — 低于此视为无频率事件
+
+    # Vdc 评分: 偏差越大分越低
+    vdc_score = max(0.0, 100.0 - m.vdc_max_dev * 2) if m.vdc_max_dev > 0 else 100.0
+
+    # 频率响应评分
+    if m.freq_response_t > 0:
+        freq_score = 100.0 * math.exp(-m.freq_response_t / 600.0)
+    elif max_df_observed < FREQ_THRESHOLD:
+        freq_score = 100.0  # 无频率事件, 不响应=正确
+    else:
+        severity = max_df_observed - FREQ_THRESHOLD
+        freq_score = max(0.0, 35.0 - severity * 300)
+
+    # SOC 评分
+    soc_score = max(0.0, 100.0 - m.soc_violations * 20)
+
+    # 效率评分
+    eff_score = m.efficiency * 100.0
+
+    # 加权综合
+    w_sum = max(s.weight_vdc_reg + s.weight_freq_support +
+                s.weight_soc_mgmt + s.weight_efficiency, 1e-6)
+    composite = (
+        s.weight_vdc_reg      * vdc_score +
+        s.weight_freq_support * freq_score +
+        s.weight_soc_mgmt     * soc_score +
+        s.weight_efficiency   * eff_score
+    ) / w_sum
+
+    return {
+        "vdc": vdc_score,
+        "freq": freq_score,
+        "soc": soc_score,
+        "eff": eff_score,
+        "composite": composite,
+    }
 
 
 # ═══════════════════════════════════════════
@@ -296,32 +331,8 @@ class ParetoAnalyzer:
     def compute_dimension_scores(cls, m: ExperimentMetrics,
                                   s: ScenarioConfig,
                                   max_df_observed: float = 0.0) -> Dict[str, float]:
-        """计算各维度独立分数 (0-100)"""
-        # Vdc
-        vdc_score = max(0, 100 - m.vdc_max_dev * 2) if m.vdc_max_dev > 0 else 100
-
-        # 频率
-        FREQ_EVENT_THRESHOLD = 0.06
-        if m.freq_response_t > 0:
-            freq_score = 100 * math.exp(-m.freq_response_t / 600.0)
-        elif max_df_observed < FREQ_EVENT_THRESHOLD:
-            freq_score = 100
-        else:
-            severity = max_df_observed - FREQ_EVENT_THRESHOLD
-            freq_score = max(0, 35 - severity * 300)
-
-        # SOC
-        soc_score = max(0, 100 - m.soc_violations * 20)
-
-        # 效率
-        eff_score = m.efficiency * 100
-
-        return {
-            "vdc": vdc_score,
-            "freq": freq_score,
-            "soc": soc_score,
-            "eff": eff_score,
-        }
+        """计算各维度独立分数 (0-100) — 委托给统一评分函数"""
+        return compute_all_scores(m, s, max_df_observed)
 
 
 # ═══════════════════════════════════════════

@@ -1,8 +1,11 @@
 """
-s4_scenarios.py — S4: AI Control Scenario Library
+s4_scenarios.py — 10个标准电网扰动场景定义。
 
-场景定义 + 度量指标 + 场景工厂
-每个场景 = 电网事件时间线 + 负载曲线 + 评估指标
+子系统: 应用层 (S4)
+依赖: grid_sim.py
+手册对应章节: CONTROL_SETPOINTS.md §2 (放电触发阈值)
+
+10个标准电网扰动场景定义。
 """
 import math
 from dataclasses import dataclass, field
